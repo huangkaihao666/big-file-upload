@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>大文件上传</title>
+    <meta charset="utf-8">
+    <link rel="stylesheet" href="./index.css">
+</head>
+<body>
+    <div class="file-input-container">
+        <input type="file" id="fileInput">
+        <button id="uploadButton" class="upload-button" onclick="uploadFile()">上传文件</button>
+        <button id="cancelButton" class="upload-button" onclick="cancelUpload()" style="background-color: #f44336; margin-left: 10px;" disabled>取消上传</button>
+    </div>
+    <div class="progress-container">
+        <div class="progress-bar">
+            <div class="progress-bar-inner" id="progressBar"></div>
+        </div>
+        <div class="progress-text" id="progress">等待上传...</div>
+        <div class="upload-speed" id="speedText"></div>
+        <div class="error-text" id="errorText"></div>
+        <div class="uploaded-chunks" id="uploadedChunks">已上传分片: 无</div>
+    </div>
+
+    <script>
+        const API_BASE_URL = location.protocol + '//' + location.hostname + ':9999';
+        const chunkSize = 512 * 1024; // 512KB 每片
+        let isUploading = false;
+        let controller = null;
+        let uploadedSize = 0;
+        let file = null;
+
+        async function checkServer() {
+            try {
+                const response = await fetch(API_BASE_URL, { method: 'GET' });
+                return response.ok;
+            } catch (err) {
+                console.error('服务器连接失败:', err);
+                return false;
+            }
+        }
+
+        function updateStatus(progress, speed, message, error = false) {
+            const progressBar = document.getElementById('progressBar');
+            const progressText = document.getElementById('progress');
+            const speedText = document.getElementById('speedText');
+            const errorText = document.getElementById('errorText');
+
+            progressBar.style.width = `${progress}%`;
+            if(progress === 100) {
+                progressText.innerText = "上传完成！";
+            } else {
+              progressText.innerText = `上传进度：${progress}%`;
+            }
+            speedText.innerText = speed || '';
+            errorText.innerText = error ? message : '';
+
+            if (error) {
+                progressText.style.color = '#f44336';
+            } else {
+                progressText.style.color = '#333';
+            }
+        }
+
+        async function uploadFile() {
+            if (isUploading) return;
+
+            const serverAvailable = await checkServer();
+            if (!serverAvailable) {
+                updateStatus(0, '', '无法连接到上传服务器，请确保服务器已启动 (npm start)', true);
+                return;
+            }
+
+            file = document.getElementById('fileInput').files[0];
+            if (!file) {
+                updateStatus(0, '', '请选择文件', true);
+                return;
+            }
+
+            const uploadButton = document.getElementById('uploadButton');
+            const cancelButton = document.getElementById('cancelButton');
+            uploadButton.disabled = true;
+            cancelButton.disabled = false;
+            isUploading = true;
+            controller = new AbortController();
+
+            try {
+                const fileHash = await calculateHash(file);
+                const uploadedChunks = await getUploadedChunks(fileHash);
+                document.getElementById('uploadedChunks').innerText = `已上传分片: ${uploadedChunks.join(', ') || '无'}`;
+
+                const chunks = Math.ceil(file.size / chunkSize);
+                uploadedSize = uploadedChunks.reduce((acc, index) => acc + Math.min(chunkSize, file.size - index * chunkSize), 0);
+                let startTime = Date.now();
+                let lastUpdate = startTime;
+
+                updateStatus(0, '', '准备上传...');
+
+                const uploadPromises = [];
+                for (let i = 0; i < chunks; i++) {
+                    if (uploadedChunks.includes(i)) continue;
+
+                    const start = i * chunkSize;
+                    const end = Math.min(file.size, start + chunkSize);
+                    const chunk = file.slice(start, end);
+
+                    const formData = new FormData();
+                    formData.append('file', chunk);
+                    formData.append('hash', fileHash);
+                    formData.append('chunkIndex', i);
+                    formData.append('chunks', chunks);
+                    formData.append('filename', file.name);
+
+                    uploadPromises.push(uploadChunk(formData).then(() => {
+                        uploadedSize += chunk.size;
+                        const progress = Math.round((uploadedSize / file.size) * 100);
+                        const now = Date.now();
+                        let speedText = '';
+
+                        if (now - lastUpdate > 100) {
+                            const speed = (uploadedSize / (now - startTime)) * 1000;
+                            speedText = `上传速度: ${formatSpeed(speed)}`;
+                            lastUpdate = now;
+                        }
+
+                        updateStatus(progress, speedText, `上传进度：${progress}%`);
+                    }));
+                }
+
+                await Promise.all(uploadPromises);
+
+                const mergeResponse = await fetch(`${API_BASE_URL}/merge`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ filename: file.name, hash: fileHash }),
+                    signal: controller.signal
+                });
+
+                if (!mergeResponse.ok) {
+                    throw new Error('文件合并失败');
+                }
+
+                const totalTime = formatTime(Date.now() - startTime);
+                updateStatus(100, `总用时: ${totalTime}`, '上传完成！');
+            } catch (err) {
+                if (err.name !== 'AbortError') {
+                    console.error('上传错误:', err);
+                    updateStatus(0, '', err.message, true);
+                }
+            } finally {
+                isUploading = false;
+                uploadButton.disabled = false;
+                cancelButton.disabled = true;
+                controller = null;
+            }
+        }
+
+      function cancelUpload() {
+          if (controller) {
+              controller.abort();
+              isUploading = false;
+              document.getElementById('uploadButton').disabled = false;
+              document.getElementById('cancelButton').disabled = true;
+
+              // 保留当前上传进度并显示取消提示
+              const progress = Math.round((uploadedSize / file.size) * 100);
+              updateStatus(progress, '', '上传已取消', true);
+          }
+      }
+
+        async function uploadChunk(formData, retryCount = 3) {
+            for (let i = 0; i < retryCount; i++) {
+                try {
+                    const response = await fetch(`${API_BASE_URL}/upload`, {
+                        method: 'POST',
+                        body: formData,
+                        signal: controller.signal
+                    });
+
+                    if (!response.ok) {
+                        throw new Error(`上传失败: ${response.status}`);
+                    }
+                    return response;
+                } catch (err) {
+                    if (err.name === 'AbortError') throw err;
+                    if (i === retryCount - 1) throw err;
+                    await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
+                }
+            }
+        }
+
+        async function getUploadedChunks(fileHash) {
+            try {
+                const response = await fetch(`${API_BASE_URL}/uploaded-chunks?hash=${fileHash}`);
+                if (response.ok) return await response.json();
+            } catch (err) {
+                console.error('获取已上传分片失败:', err);
+            }
+            return [];
+        }
+
+        function formatSpeed(bytesPerSecond) {
+            if (bytesPerSecond < 1024) return `${bytesPerSecond.toFixed(1)} B/s`;
+            if (bytesPerSecond < 1024 * 1024) return `${(bytesPerSecond / 1024).toFixed(1)} KB/s`;
+            return `${(bytesPerSecond / (1024 * 1024)).toFixed(1)} MB/s`;
+        }
+
+        function formatTime(ms) {
+            if (ms < 1000) return `${ms}毫秒`;
+            if (ms < 60000) return `${(ms / 1000).toFixed(1)}秒`;
+            const minutes = Math.floor(ms / 60000);
+            const seconds = ((ms % 60000) / 1000).toFixed(1);
+            return `${minutes}分${seconds}秒`;
+        }
+
+        async function calculateHash(file) {
+            return `${file.name}-${file.size}`;
+        }
+
+        window.addEventListener('beforeunload', (event) => {
+            if (isUploading) {
+                event.preventDefault();
+                event.returnValue = '文件正在上传，确定要离开吗？';
+            }
+        });
+
+        // 在顶层变量中增加断网提示标志
+        let networkPaused = false;
+
+        window.addEventListener('offline', () => {
+            if (isUploading && !networkPaused) { // 确保断网提示只显示一次
+                controller.abort(); // 停止上传
+                isUploading = false; // 停止上传标记
+                networkPaused = true; // 标记断网状态
+                document.getElementById('uploadButton').disabled = false;
+                document.getElementById('cancelButton').disabled = true;
+
+                // 保留当前进度并显示断网提示
+                const progress = Math.round((uploadedSize / file.size) * 100);
+                updateStatus(progress, '', '网络断开，上传已暂停', true);
+            }
+        });
+
+        window.addEventListener('online', () => {
+            if (networkPaused) {
+                networkPaused = false; // 恢复网络状态标记
+                updateStatus(
+                    Math.round((uploadedSize / file.size) * 100),
+                    '',
+                    '网络恢复，您可以重新开始上传'
+                );
+            }
+        });
+    </script>
+</body>
+</html>
